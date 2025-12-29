@@ -1,0 +1,15 @@
+from typing import Literal
+
+CHAT_INTENT = Literal[
+	"GENERAL_CHAT",
+	"FAILED_TRANSACTION",
+	"DOUBLE_DEBIT",
+	"UNSUPPORTED_COMPLAIN"
+]
+
+STEPS = Literal[
+	"INTENT_CHECK",
+	"USER_VERIF",
+	"TRANSACTION_VERIF",
+	"TICKETING",
+]
