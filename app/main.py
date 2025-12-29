@@ -19,6 +19,8 @@ from langchain.messages import HumanMessage, AIMessage, SystemMessage, AnyMessag
 
 from model import llm
 from config import CHAT_INTENT, STEPS
+import tools
+
 from sops.sop1_failed_transaction import construct_graph as sop1_construct_graph, Sop1State
 from sops.sop2_double_debit import construct_graph as sop2_construct_graph, Sop2State
 
@@ -92,8 +94,8 @@ def node_check_user_intent (state: CoreState) -> CoreState:
 	return state
 
 
-def node_user_verification (state: CoreState) -> CoreState:
-	state.current_step = "USER_VERIF"
+def node_user_info_gathering (state: CoreState) -> CoreState:
+	state.current_step = "USER_GATHERING"
 	
 	prompt = """tugas kamu adalah mengambil informasi tentang email dan nomor hp dari pesan user."""
 
@@ -120,9 +122,25 @@ def node_user_verification (state: CoreState) -> CoreState:
 	else:
 		state.is_early_exit = False
 
-	print(f"""-> node_user_verification
+	print(f"""-> node_user_info_gathering
 		user_email = {state.user_email}
 		user_phone = {state.user_phone}""")
+	return state
+
+
+def node_user_verification (state: CoreState) -> CoreState:
+	state.current_step = "USER_VERIF"
+	
+	is_verified = tools.verify_user(
+		email=state.user_email,
+		phone=state.user_phone,
+	)
+
+	if not is_verified:
+		state.is_early_exit = True
+	else:
+		state.is_early_exit = False
+
 	return state
 
 
@@ -144,7 +162,7 @@ def node_process_final_answer (state: CoreState) -> CoreState:
 		karena komplain dari user belum dapat diselesaikan, sampaikan permohonan maaf.
 		"""
 
-	elif state.is_early_exit and state.current_step == "USER_VERIF":
+	elif state.is_early_exit and state.current_step == "USER_GATHERING":
 		prompt += f"""
 		Jawab pesan dari user sesuai dengan informasi berikut.
 		- support type: {state.intent}
@@ -157,7 +175,21 @@ def node_process_final_answer (state: CoreState) -> CoreState:
 		jangan meminta untuk melengkapi diluar hal tersebut.
 		"""
 
-	elif state.current_step in ["TRANSACTION_VERIF", "TICKETING"]:
+	elif state.is_early_exit and state.current_step == "USER_VERIF":
+		prompt += f"""
+		Jawab pesan dari user sesuai dengan informasi berikut.
+		- support type: {state.intent}
+
+		berikut informasi yang user berikan, tapi tidak ditemukan di database:
+		- EMAIL: {state.user_email}
+		- PHONE: {state.user_phone}
+
+		beritahu ke user bahwa datanya tidak ditemukan di database,
+		dan minta untuk memeriksa ulang data yang diinputkan.
+		jangan konfirmasi diluar hal tersebut.
+		"""
+
+	elif state.current_step in ["TRANSACTION_GATHERING", "TRANSACTION_VERIF", "TICKETING"]:
 		prompt += state.sop_additional_prompt
 
 
@@ -275,6 +307,7 @@ def construct_graph():
 	
 	# main nodes definition
 	graph.add_node(node_check_user_intent)
+	graph.add_node(node_user_info_gathering)
 	graph.add_node(node_user_verification)
 	graph.add_node(node_call_subgraph)
 	graph.add_node(node_process_final_answer)
@@ -286,14 +319,20 @@ def construct_graph():
 
 	# edges definition
 	graph.add_conditional_edges(START, gate_entry_routing, {
-		"INTENT_CHECK"		: 'node_check_user_intent',
-		"USER_VERIF"		: 'node_user_verification',
-		"TRANSACTION_VERIF"	: 'node_call_subgraph',
-		"TICKETING"			: 'node_call_subgraph',
+		"INTENT_CHECK"			: 'node_check_user_intent',
+		"USER_GATHERING"		: 'node_user_info_gathering',
+		"USER_VERIF"			: 'node_user_info_gathering',
+		"TRANSACTION_GATHERING"	: 'node_call_subgraph',
+		"TRANSACTION_VERIF"		: 'node_call_subgraph',
+		"TICKETING"				: 'node_call_subgraph',
 	})
 	graph.add_conditional_edges('node_check_user_intent', gate_is_valid_complain, {
-		True: 'node_user_verification', 
+		True: 'node_user_info_gathering', 
 		False: 'node_process_final_answer'
+	})
+	graph.add_conditional_edges('node_user_info_gathering', gate_is_early_exit, {
+		True: 'node_process_final_answer',
+		False: 'node_user_verification'
 	})
 	graph.add_conditional_edges('node_user_verification', gate_is_early_exit, {
 		True: 'node_process_final_answer',

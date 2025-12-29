@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langchain.messages import HumanMessage, SystemMessage
 
+import tools
 from model import llm
 from config import CHAT_INTENT, STEPS
 
@@ -66,8 +67,8 @@ class Sop1State(BaseModel):
 # NODE DEFINITION
 # -------------------------------------------------------------------------------------
 
-def node_transaction_verification(state: Sop1State) -> Sop1State:
-	state.current_step = "TRANSACTION_VERIF"
+def node_transaction_info_gathering(state: Sop1State) -> Sop1State:
+	state.current_step = "TRANSACTION_GATHERING"
 	
 	prompt = """tugas kamu adalah mengambil informasi tentang data transaksi dari pesan user."""
 
@@ -119,7 +120,7 @@ def node_transaction_verification(state: Sop1State) -> Sop1State:
 	else:
 		state.is_early_exit = False
 
-	print(f"""-> node_transaction_verification
+	print(f"""-> node_transaction_info_gathering
 		- state.reference_id = {state.reference_id}
 		- state.transaction_date = {state.transaction_date}
 		- state.transaction_time = {state.transaction_time}
@@ -129,19 +130,39 @@ def node_transaction_verification(state: Sop1State) -> Sop1State:
 	return state
 
 
+def node_transaction_verification (state: Sop1State) -> Sop1State:
+	state.current_step = "TRANSACTION_VERIF"
+	
+	is_verified = tools.verify_transaction(
+		reference_id=state.reference_id,
+		transaction_date=state.transaction_date,
+		transaction_time=state.transaction_time,
+		destination_bank=state.destination_bank,
+		destination_account=state.destination_account,
+		amount=state.amount
+	)
+
+	if not is_verified:
+		state.is_early_exit = True
+	else:
+		state.is_early_exit = False
+
+	return state
+
+
 def node_create_ticket(state: Sop1State) -> Sop1State:
 	state.current_step = "TICKETING"
 	state.ticket_id = str(uuid4())
 	state.ticket_title = "lorem ipsum"
 
-	print('-> node_transaction_verification', state.ticket_id)
+	print('-> node_transaction_info_gathering', state.ticket_id)
 	return state
 
 
 def node_process_additional_prompt(state: Sop1State) -> Sop1State:
 	print("-> node_process_additional_prompt")
 
-	if state.is_early_exit and state.current_step == "TRANSACTION_VERIF":
+	if state.is_early_exit and state.current_step == "TRANSACTION_GATHERING":
 		state.addtitional_prompt = f"""
 		Jawab pesan dari user sesuai dengan informasi berikut.
 		- support type: {state.intent}
@@ -160,6 +181,28 @@ def node_process_additional_prompt(state: Sop1State) -> Sop1State:
 
 		jika salah satu dari informasi tersebut tidak ada (None), maka minta user untuk melengkapinya.
 		jangan meminta untuk melengkapi diluar hal tersebut.
+		"""
+
+	if state.is_early_exit and state.current_step == "TRANSACTION_VERIF":
+		state.addtitional_prompt = f"""
+		Jawab pesan dari user sesuai dengan informasi berikut.
+		- support type: {state.intent}
+
+		berikut informasi data diri user:
+		- email: {state.user_email}
+		- nomor handphone: {state.user_phone}
+
+		berikut informasi transaksi diberikan oleh user, tapi tidak ditemukan di database:
+		- reference ID: {state.reference_id}
+		- tanggal transaksi: {state.transaction_date}
+		- waktu / jam transaksi: {state.transaction_time}
+		- nama bank penerima: {state.destination_bank}
+		- nomor rekening penerima: {state.destination_account}
+		- nominal transaksi: {state.amount}
+
+		beritahu ke user bahwa data transaksinya tidak ditemukan di database,
+		dan minta untuk memeriksa ulang data transaksi yang diinputkan.
+		jangan konfirmasi diluar hal tersebut.
 		"""
 
 	elif state.current_step == "TICKETING":
@@ -198,7 +241,7 @@ def gate_entry_routing (state: Sop1State) -> str:
 	if state.is_early_exit:
 		entry_step = state.current_step
 	else:
-		entry_step = "TRANSACTION_VERIF"
+		entry_step = "TRANSACTION_GATHERING"
 
 	print('-> gate_entry_routing', entry_step)
 	return entry_step
@@ -219,14 +262,20 @@ def construct_graph():
 	graph = StateGraph(Sop1State)
 
 	# main nodes definition
+	graph.add_node(node_transaction_info_gathering)
 	graph.add_node(node_transaction_verification)
 	graph.add_node(node_create_ticket)
 	graph.add_node(node_process_additional_prompt)
 
 	# edges definition
 	graph.add_conditional_edges(START, gate_entry_routing, {
-		"TRANSACTION_VERIF"	: 'node_transaction_verification',
-		"TICKETING"			: 'node_create_ticket'
+		"TRANSACTION_GATHERING"	: 'node_transaction_info_gathering',
+		"TRANSACTION_VERIF"	: 'node_transaction_info_gathering',
+		"TICKETING"				: 'node_create_ticket'
+	})
+	graph.add_conditional_edges('node_transaction_info_gathering', gate_is_early_exit, {
+		True: 'node_process_additional_prompt',
+		False: 'node_transaction_verification'
 	})
 	graph.add_conditional_edges('node_transaction_verification', gate_is_early_exit, {
 		True: 'node_process_additional_prompt',
