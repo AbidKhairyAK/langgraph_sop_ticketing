@@ -7,7 +7,7 @@
 # - invalid data (post db call) harus dihandle dengan benar
 # - technical error juga harus dihandle dengan benar
 # - is_early_exit tidak boleh dicleanup, hanya boleh dihapus oleh node penyebabnya
-
+from textwrap import dedent
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -18,26 +18,28 @@ from langgraph.graph import StateGraph, START, END
 from langchain.messages import HumanMessage, AIMessage, SystemMessage, AnyMessage
 
 from model import llm
-from config import CHAT_INTENT, STEPS
+from config import CHAT_INTENT, MAIN_GRAPH_STATUS
 import tools
 
 from sops.sop1_failed_transaction import construct_graph as sop1_construct_graph, Sop1State
-from sops.sop2_double_debit import construct_graph as sop2_construct_graph, Sop2State
 
 
 # -------------------------------------------------------------------------------------
 # STATE DEFINITION
 # -------------------------------------------------------------------------------------
 
-class CoreState(BaseModel):
+class MainState(BaseModel):
 	# input
 	user_input: Optional[str] = None
 	conversation: List[AnyMessage] = []
 	
 	# process
 	intent: Optional[CHAT_INTENT] = None
-	current_step: Optional[STEPS] = None
+	graph_status: Optional[MAIN_GRAPH_STATUS] = None
 	is_early_exit: bool = False
+	is_user_gathered: bool = False
+	is_user_verified: bool = False
+	is_sop_complete: bool = False
 	
 	# user verification data
 	user_email: Optional[str] = None
@@ -45,7 +47,6 @@ class CoreState(BaseModel):
 
 	# subgraph states
 	sop1_state: Optional[Sop1State] = None
-	sop2_state: Optional[Sop2State] = None
 
 	# output
 	sop_additional_prompt: Optional[str] = None
@@ -56,7 +57,7 @@ class CoreState(BaseModel):
 # IN-MEMORY DATABASE
 # -------------------------------------------------------------------------------------
 
-saved_state: Optional[CoreState] = None
+saved_state: Optional[MainState] = None
 saved_conversation: List[AnyMessage] = []
 
 
@@ -64,8 +65,8 @@ saved_conversation: List[AnyMessage] = []
 # NODE DEFINITION
 # -------------------------------------------------------------------------------------
 
-def node_check_user_intent (state: CoreState) -> CoreState:
-	state.current_step = "INTENT_CHECK"
+def node_check_user_intent (state: MainState) -> MainState:
+	state.graph_status = "INTENT_CHECK"
 	
 	prompt = "kamu adalah intent clasifier yang bertugas untuk mengecek intent dari sebuah pesan."
 
@@ -80,7 +81,6 @@ def node_check_user_intent (state: CoreState) -> CoreState:
 			jika pesan user seperti percakapan kasual, maka return GENERAL_CHAT.
 			jika pesan user seperti komplain, maka klasifikasikan berdasarkan jenis komplain berikut:
 			- FAILED_TRANSACTION: berkaitan dengan transaksi gagal, transfer uang gagal
-			- DOUBLE_DEBIT: berkaitan dengan transaksi yang tercatat lebih dari sekali padahal cuma dilakukan sekali
 			- UNSUPPORTED_COMPLAIN: jika komplainnya tidak memenuhi kriteria di atas  
 			"""
 		)
@@ -94,15 +94,13 @@ def node_check_user_intent (state: CoreState) -> CoreState:
 	return state
 
 
-def node_user_info_gathering (state: CoreState) -> CoreState:
-	state.current_step = "USER_GATHERING"
+def node_user_info_gathering (state: MainState) -> MainState:
+	state.graph_status = "USER_GATHERING"
 	
 	prompt = """tugas kamu adalah mengambil informasi tentang email dan nomor hp dari pesan user."""
 
-	conversation = [
-		SystemMessage(prompt),
-		HumanMessage(state.user_input)
-	]
+	conversation = [ SystemMessage(prompt) ] + state.conversation
+
 
 	class UserInfo(BaseModel):
 		user_email: Optional[str] = Field(..., description="email dari user")
@@ -121,6 +119,7 @@ def node_user_info_gathering (state: CoreState) -> CoreState:
 		state.is_early_exit = True
 	else:
 		state.is_early_exit = False
+		state.is_user_gathered = True
 
 	print(f"""-> node_user_info_gathering
 		user_email = {state.user_email}
@@ -128,8 +127,8 @@ def node_user_info_gathering (state: CoreState) -> CoreState:
 	return state
 
 
-def node_user_verification (state: CoreState) -> CoreState:
-	state.current_step = "USER_VERIF"
+def node_user_verification (state: MainState) -> MainState:
+	state.graph_status = "USER_VERIF"
 	
 	is_verified = tools.verify_user(
 		email=state.user_email,
@@ -140,30 +139,37 @@ def node_user_verification (state: CoreState) -> CoreState:
 		state.is_early_exit = True
 	else:
 		state.is_early_exit = False
+		state.is_user_verified = True
 
 	return state
 
 
-def node_call_subgraph (state: CoreState) -> CoreState:
+def node_call_subgraph (state: MainState) -> MainState:
 	print("-> node_call_subgraph", state.intent)
+	state.graph_status = "SUBGRAPH"
 	return state
 
 
-def node_process_final_answer (state: CoreState) -> CoreState:
+def node_process_final_answer (state: MainState) -> MainState:
 	print("-> node_process_final_answer")
-	prompt="""Kamu adalah customer support agent."""
+	prompt="""Kamu adalah customer support agent.\n\n"""
 	
 
 	if state.intent == "UNSUPPORTED_COMPLAIN":
-		prompt += f"""
+		print("CASE: unsupported complain")
+
+		prompt += dedent(f"""\
 		Jawab pesan dari user sesuai dengan informasi berikut.
 		- support type: UNSUPPORTED_COMPLAIN.
 
 		karena komplain dari user belum dapat diselesaikan, sampaikan permohonan maaf.
-		"""
+		jangan tawarkan penyelesaian lain.
+		""")
 
-	elif state.is_early_exit and state.current_step == "USER_GATHERING":
-		prompt += f"""
+	elif state.is_early_exit and not state.is_user_gathered:
+		print("CASE: incomplete user information")
+
+		prompt += dedent(f"""\
 		Jawab pesan dari user sesuai dengan informasi berikut.
 		- support type: {state.intent}
 
@@ -173,10 +179,12 @@ def node_process_final_answer (state: CoreState) -> CoreState:
 
 		jika salah satu atau kedua dari informasi tersebut tidak ada, maka minta user untuk melengkapi email dan nomor hp.
 		jangan meminta untuk melengkapi diluar hal tersebut.
-		"""
+		""")
 
-	elif state.is_early_exit and state.current_step == "USER_VERIF":
-		prompt += f"""
+	elif state.is_early_exit and not state.is_user_verified:
+		print("CASE: invalid user information")
+
+		prompt += dedent(f"""\
 		Jawab pesan dari user sesuai dengan informasi berikut.
 		- support type: {state.intent}
 
@@ -187,11 +195,14 @@ def node_process_final_answer (state: CoreState) -> CoreState:
 		beritahu ke user bahwa datanya tidak ditemukan di database,
 		dan minta untuk memeriksa ulang data yang diinputkan.
 		jangan konfirmasi diluar hal tersebut.
-		"""
+		""")
 
-	elif state.current_step in ["TRANSACTION_GATHERING", "TRANSACTION_VERIF", "TICKETING"]:
+	elif state.graph_status == "SUBGRAPH":
 		prompt += state.sop_additional_prompt
 
+	
+	print('\n')
+	print(prompt)
 
 	conversation = [ SystemMessage(prompt) ] + state.conversation
 	llm_result = llm.invoke(conversation)
@@ -202,7 +213,15 @@ def node_process_final_answer (state: CoreState) -> CoreState:
 	return state
 
 
-def node_save_conversation_and_state (state: CoreState) -> CoreState:
+def node_complete_graph (state: MainState) -> MainState:
+	if state.is_sop_complete:
+		state.graph_status = 'COMPLETED'
+		
+	print('-> node_complete_graph', state.graph_status)
+	return state
+
+
+def node_save_conversation_and_state (state: MainState) -> MainState:
 	print("-> node_save_conversation_and_state")
 	global saved_conversation
 	global saved_state
@@ -215,7 +234,7 @@ def node_save_conversation_and_state (state: CoreState) -> CoreState:
 # SUB-GRAPH DEFINITION
 # -------------------------------------------------------------------------------------
 
-def call_sop1 (state: CoreState) -> CoreState:
+def call_sop1 (state: MainState) -> MainState:
 	print("-> call_sop1")
 
 	sop_state = state.sop1_state if state.sop1_state else Sop1State()
@@ -223,34 +242,16 @@ def call_sop1 (state: CoreState) -> CoreState:
 	sop_state.user_email = state.user_email
 	sop_state.user_phone = state.user_phone
 	sop_state.intent = state.intent
+	sop_state.conversation = state.conversation
 
 	subgraph = sop1_construct_graph()
 	subgraph_result = subgraph.invoke(sop_state)
 	
 	state.sop1_state = Sop1State(**subgraph_result)
+
 	state.is_early_exit = state.sop1_state.is_early_exit
-	state.current_step = state.sop1_state.current_step
 	state.sop_additional_prompt = state.sop1_state.addtitional_prompt
-
-	return state
-
-
-def call_sop2 (state: CoreState) -> CoreState:
-	print("-> call_sop2")
-
-	sop_state = Sop2State(**state.sop2_state) if state.sop2_state else Sop2State()
-	sop_state.user_input=state.user_input,
-	sop_state.user_email=state.user_email,
-	sop_state.user_phone=state.user_phone,
-	sop_state.intent=state.intent,
-
-	subgraph = sop2_construct_graph()
-	subgraph_result = subgraph.invoke(sop_state)
-	
-	state.sop2_state = Sop2State(**subgraph_result)
-	state.is_early_exit = state.sop2_state.is_early_exit
-	state.current_step = state.sop2_state.current_step
-	state.sop_additional_prompt = state.sop2_state.addtitional_prompt
+	state.is_sop_complete = state.sop1_state.graph_status == "COMPLETED"
 
 	return state
 
@@ -259,11 +260,11 @@ def call_sop2 (state: CoreState) -> CoreState:
 # GATE DEFINITION
 # -------------------------------------------------------------------------------------
 
-def gate_entry_routing (state: CoreState) -> str:
-	entry_step: STEPS
+def gate_entry_routing (state: MainState) -> str:
+	entry_step: MAIN_GRAPH_STATUS
 	
 	if state.is_early_exit:
-		entry_step = state.current_step
+		entry_step = state.graph_status
 	else:
 		entry_step = "INTENT_CHECK"
 
@@ -271,17 +272,17 @@ def gate_entry_routing (state: CoreState) -> str:
 	return entry_step
 
 
-def gate_is_valid_complain (state: CoreState) -> bool:
+def gate_is_valid_complain (state: MainState) -> bool:
 	is_valid_complain = state.intent not in ["GENERAL_CHAT", "UNSUPPORTED_COMPLAIN"]
 
 	print('-> gate_is_valid_complain', state.intent, is_valid_complain)
 	return is_valid_complain
 
 
-def gate_is_early_exit (state: CoreState) -> bool:
+def gate_is_early_exit (state: MainState) -> bool:
 	print(f"""-> gate_is_early_exit
 	   - state.is_early_exit: {state.is_early_exit}
-	   - state.current_step: {state.current_step}
+	   - state.graph_status: {state.graph_status}
 	   - state.intent: {state.intent}""")
 	return state.is_early_exit
 
@@ -290,8 +291,8 @@ def gate_is_early_exit (state: CoreState) -> bool:
 # LANGGRAPH EXECUTION
 # -------------------------------------------------------------------------------------
 
-def prepare_state (user_input: str) -> CoreState:
-	state = CoreState() if not saved_state else saved_state
+def prepare_state (user_input: str) -> MainState:
+	state = MainState() if not saved_state else saved_state
 
 	state.user_input = user_input
 	state.result = None
@@ -303,7 +304,7 @@ def prepare_state (user_input: str) -> CoreState:
 
 
 def construct_graph():
-	graph = StateGraph(CoreState)
+	graph = StateGraph(MainState)
 	
 	# main nodes definition
 	graph.add_node(node_check_user_intent)
@@ -311,20 +312,19 @@ def construct_graph():
 	graph.add_node(node_user_verification)
 	graph.add_node(node_call_subgraph)
 	graph.add_node(node_process_final_answer)
+	graph.add_node(node_complete_graph)
 	graph.add_node(node_save_conversation_and_state)
 
 	# subgraph nodes definition
 	graph.add_node(call_sop1)
-	graph.add_node(call_sop2)
 
 	# edges definition
 	graph.add_conditional_edges(START, gate_entry_routing, {
-		"INTENT_CHECK"			: 'node_check_user_intent',
-		"USER_GATHERING"		: 'node_user_info_gathering',
-		"USER_VERIF"			: 'node_user_info_gathering',
-		"TRANSACTION_GATHERING"	: 'node_call_subgraph',
-		"TRANSACTION_VERIF"		: 'node_call_subgraph',
-		"TICKETING"				: 'node_call_subgraph',
+		"COMPLETED"			: 'node_check_user_intent',
+		"INTENT_CHECK"		: 'node_check_user_intent',
+		"USER_GATHERING"	: 'node_user_info_gathering',
+		"USER_VERIF"		: 'node_user_info_gathering',
+		"SUBGRAPH"			: 'node_call_subgraph',
 	})
 	graph.add_conditional_edges('node_check_user_intent', gate_is_valid_complain, {
 		True: 'node_user_info_gathering', 
@@ -340,13 +340,15 @@ def construct_graph():
 	})
 	graph.add_conditional_edges('node_call_subgraph', lambda state: state.intent, {
 		'FAILED_TRANSACTION'	: 'call_sop1',
-		'DOUBLE_DEBIT'			: 'call_sop2'
 	})
 	
 	graph.add_edge('call_sop1', 'node_process_final_answer')
-	graph.add_edge('call_sop2', 'node_process_final_answer')
 
-	graph.add_edge('node_process_final_answer', 'node_save_conversation_and_state')
+	graph.add_conditional_edges('node_process_final_answer', gate_is_early_exit, {
+		False: 'node_complete_graph',
+		True: 'node_save_conversation_and_state'
+	})
+	graph.add_edge('node_complete_graph', 'node_save_conversation_and_state')
 	graph.add_edge('node_save_conversation_and_state', END)
 
 	return graph.compile()
@@ -357,7 +359,9 @@ def construct_graph():
 # -------------------------------------------------------------------------------------
 
 while True:
+	print('\n')
 	user_input = input('[User]: ')
+	print('\n')
 
 	if not user_input:
 		print('\ntolong tulis sesuatu.\n')
@@ -369,4 +373,5 @@ while True:
 	
 	graph_result = graph.invoke(state)
 
+	print('\n')
 	print(f"[AI]: {graph_result["result"]}")

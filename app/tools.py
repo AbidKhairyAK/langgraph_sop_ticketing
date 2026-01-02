@@ -1,3 +1,5 @@
+from uuid import uuid4
+from config import TRX_STATUS
 from mock_data import MOCK_USERS, MOCK_TRANSACTIONS 
 
 def verify_user(email: str, phone: str) -> dict:
@@ -19,3 +21,9 @@ def verify_transaction(
 					  										and trx["amount"] == amount)
 	
 	return next(filter_transaction, None)
+
+def create_ticket(status: TRX_STATUS):
+	return {
+		'ticket_id':  str(uuid4()),
+		'ticket_title': f'Ticket with {TRX_STATUS} transaction status'
+	}
